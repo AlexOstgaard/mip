@@ -1,0 +1,8 @@
+# Compiled binaries
+mipd
+ping_server
+ping_client
+test_header
+
+# Object files
+*.o
