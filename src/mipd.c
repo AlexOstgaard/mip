@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <string.h>
+#include <poll.h>
 
 /*
  Print usage information to stderr. 
@@ -54,32 +55,68 @@ int setup_unix_socket(const char *path)
 
 
 /*
-Accept one connection on the upper-layer UNIX socket and read
-a single message from it, for testing the message format.
+Run MIP daemon's main event loop.
+
+Waits for activity on the listening upper-layer UNIX socket and, 
+once a client is connected, on that client's socket as well, using poll(). 
+Accepts new client connections, and reads and prints messages received from the connected client. 
+Only one upper-layer client is supported at a time, per the assignment specification.
+Once a client disconnects, the daemon goes back to waiting for a new connection.
 */
-int handle_upper_layer(int sd_upper){
+void run_daemon(int sd_upper, int debug) {
 
-    int client_sd = accept(sd_upper, NULL, NULL);
-    if (client_sd == -1) {
-        perror("accept");
-        exit(1);
+    int client_sd = -1;
+
+    while (1) {
+        struct pollfd fds[2];
+        int nfds = 0;
+
+        fds[nfds].fd = sd_upper;
+        fds[nfds].events = POLLIN;
+        nfds++;
+
+        if (client_sd != -1) {
+            fds[nfds].fd = client_sd;
+            fds[nfds].events = POLLIN;
+            nfds++;
+        }
+
+        int ret = poll(fds, nfds, -1);
+        if (ret == -1) {
+            perror("poll");
+            break;
+        }
+
+        /* Check if new client wants to connect */
+        if (fds[0].revents & POLLIN) {
+            client_sd = accept(sd_upper, NULL, NULL);
+            if (debug)
+                printf("New client connected, fd=%d\n", client_sd);
+        }
+
+        /* Check if connected client has sent anything */
+        if (client_sd != -1 && nfds == 2 && (fds[1].revents & POLLIN)) {
+        
+            uint8_t buf[1500];
+            ssize_t n = recv(client_sd, buf, sizeof(buf), 0);
+
+            if (n <= 0) {
+                if (n == 0) {
+                    printf("Client closed the connection\n");
+                } else {
+                    perror("recv");
+                }
+                close(client_sd);
+                client_sd = -1;
+            } else {
+                uint8_t dest_mip = buf[0];
+                uint8_t *payload = &buf[1];
+                size_t payload_len = n - 1;
+                printf("Received message for/from MIP address %u, %zu bytes payload: %.*s\n",
+                    dest_mip, payload_len, (int)payload_len, payload);
+            }
+        }
     }
-
-    uint8_t buf[1500];
-    ssize_t n = recv(client_sd, buf, sizeof(buf), 0);
-
-    if (n == -1) {
-        perror("recv");
-    } else if (n == 0) {
-        printf("Client closed connection \n");
-    } else {
-        uint8_t dest_mip = buf[0];
-        uint8_t *payload = &buf[1];
-        size_t payload_len = n - 1;
-        printf("Recieved message from/to MIP-address %u, %zu bytes payload\n", dest_mip, payload_len);
-    }
-    
-    return client_sd;
 }
 
 /*
@@ -124,7 +161,7 @@ int main(int argc, char *argv[]) {
     if (debug)
         printf("UNIX socket bound and listening on %s (fd=%d)\n", socket_upper, sd_upper);
 
-    int client_sd = handle_upper_layer(sd_upper);
+    run_daemon(sd_upper, debug);
 
     return 0;
 }
