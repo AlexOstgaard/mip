@@ -6,6 +6,10 @@
 #include <sys/un.h>
 #include <string.h>
 #include <poll.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netpacket/packet.h>
+#include <arpa/inet.h>
 
 /*
  Print usage information to stderr. 
@@ -53,6 +57,22 @@ int setup_unix_socket(const char *path)
     return sd;
 }
 
+/* 
+Create a raw AF_PACKET socket for sending and receiving 
+Ethernet frames with the MIP ethertype, on all interfaces.
+*/
+int setup_raw_socket(void) {
+
+    int sd_raw = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_MIP));
+    
+    if (sd_raw == -1) {
+        perror("socket (raw)");
+        exit(1);
+    }
+
+    return sd_raw;
+}
+
 
 /*
 Run MIP daemon's main event loop.
@@ -63,21 +83,27 @@ Accepts new client connections, and reads and prints messages received from the 
 Only one upper-layer client is supported at a time, per the assignment specification.
 Once a client disconnects, the daemon goes back to waiting for a new connection.
 */
-void run_daemon(int sd_upper, int debug) {
+void run_daemon(int sd_upper, int sd_raw, int debug) {
 
     int client_sd = -1;
 
     while (1) {
-        struct pollfd fds[2];
+        struct pollfd fds[3];
         int nfds = 0;
 
         fds[nfds].fd = sd_upper;
         fds[nfds].events = POLLIN;
         nfds++;
 
+        fds[nfds].fd = sd_raw;
+        fds[nfds].events = POLLIN;
+        nfds++;
+
+        int client_idx = -1;
         if (client_sd != -1) {
             fds[nfds].fd = client_sd;
             fds[nfds].events = POLLIN;
+            client_idx = nfds;
             nfds++;
         }
 
@@ -87,16 +113,22 @@ void run_daemon(int sd_upper, int debug) {
             break;
         }
 
-        /* Check if new client wants to connect */
+        /* New client wants to connect */
         if (fds[0].revents & POLLIN) {
             client_sd = accept(sd_upper, NULL, NULL);
             if (debug)
                 printf("New client connected, fd=%d\n", client_sd);
         }
 
-        /* Check if connected client has sent anything */
-        if (client_sd != -1 && nfds == 2 && (fds[1].revents & POLLIN)) {
-        
+        /* Raw Ethernet frame has arrived */
+        if (fds[1].revents & POLLIN) {
+            uint8_t raw_buf[1514];
+            ssize_t n = recv(sd_raw, raw_buf, sizeof(raw_buf), 0);
+            printf("Received %zd bytes on raw socket\n", n);
+        }
+
+        /* Connected client has sent something */
+        if (client_idx != -1 && (fds[client_idx].revents & POLLIN)) {
             uint8_t buf[1500];
             ssize_t n = recv(client_sd, buf, sizeof(buf), 0);
 
@@ -118,6 +150,44 @@ void run_daemon(int sd_upper, int debug) {
         }
     }
 }
+
+/*
+Discover all Ethernet interfaces (excluding loopback) on this host.
+Returns the number of interfaces found, written into ifaces[0..n-1].
+Exits the program on fatal error (getifaddrs failure).
+*/
+int discover_interfaces(struct mip_iface *ifaces)
+{
+    struct ifaddrs *addrs, *ifa;
+    int count = 0;
+
+    if (getifaddrs(&addrs) == -1) {
+        perror("getifaddrs");
+        exit(1);
+    }
+
+    for (ifa = addrs; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
+        if (ifa->ifa_addr->sa_family != AF_PACKET)
+            continue;
+        if (strcmp(ifa->ifa_name, "lo") == 0)
+            continue;
+        if (count >= MAX_IFACES)
+            break;
+
+        struct sockaddr_ll *sll = (struct sockaddr_ll *)ifa->ifa_addr;
+
+        strncpy(ifaces[count].name, ifa->ifa_name, IF_NAMESIZE - 1);
+        ifaces[count].ifindex = sll->sll_ifindex;
+        memcpy(ifaces[count].mac, sll->sll_addr, 6);
+        count++;
+    }
+
+    freeifaddrs(addrs);
+    return count;
+}
+
 
 /*
 Entry point for MIP daemon.
@@ -161,7 +231,22 @@ int main(int argc, char *argv[]) {
     if (debug)
         printf("UNIX socket bound and listening on %s (fd=%d)\n", socket_upper, sd_upper);
 
-    run_daemon(sd_upper, debug);
+    struct mip_iface ifaces[MAX_IFACES];
+    int n_ifaces = discover_interfaces(ifaces);
+
+    for (int i = 0; i < n_ifaces; i++) {
+        printf("Interface: %s, ifindex=%d, MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
+        ifaces[i].name, ifaces[i].ifindex,
+        ifaces[i].mac[0], ifaces[i].mac[1], ifaces[i].mac[2],
+        ifaces[i].mac[3], ifaces[i].mac[4], ifaces[i].mac[5]);
+    }
+
+    int sd_raw = setup_raw_socket();
+
+    if (debug)
+        printf("Raw socket created (fd=%d)\n", sd_raw);
+
+    run_daemon(sd_upper, sd_raw, debug);
 
     return 0;
 }
