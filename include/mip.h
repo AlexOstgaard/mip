@@ -23,6 +23,8 @@
 
 #define MAX_IFACES 8
 
+#define MIP_HEADER_LEN 4
+
 /* Represent one Ethernet interface on this host */
 struct mip_iface {
     char name[IF_NAMESIZE];
@@ -40,6 +42,15 @@ void mip_unpack_header(const uint8_t *buf, uint8_t *dst, uint8_t *src,
 
 /* Discover all Ethernet interfaces on this host, excluding loopback. */
 int discover_interfaces(struct mip_iface *ifaces);
+
+/* 
+Build a MIP frame (Ethernet header + MIP header + SDU) and send
+it on the given raw socket and interface. 
+*/
+int send_mip_frame(int sd_raw, int ifindex,
+                   const uint8_t *src_mac, const uint8_t *dest_mac,
+                   uint8_t mip_dst, uint8_t mip_src, uint8_t ttl,
+                   uint8_t sdu_type, const uint8_t *sdu, size_t sdu_len_bytes);
 
 #endif
 

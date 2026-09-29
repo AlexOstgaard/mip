@@ -10,6 +10,9 @@
 #include <net/if.h>
 #include <netpacket/packet.h>
 #include <arpa/inet.h>
+#include <linux/if_ether.h>
+#include <errno.h>
+
 
 /*
  Print usage information to stderr. 
@@ -75,6 +78,234 @@ int setup_raw_socket(void) {
 
 
 /*
+Discover all Ethernet interfaces (excluding loopback) on this host.
+Returns the number of interfaces found, written into ifaces[0..n-1].
+Exits the program on fatal error (getifaddrs failure).
+*/
+int discover_interfaces(struct mip_iface *ifaces)
+{
+    struct ifaddrs *addrs, *ifa;
+    int count = 0;
+
+    if (getifaddrs(&addrs) == -1) {
+        perror("getifaddrs");
+        exit(1);
+    }
+
+    for (ifa = addrs; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
+        if (ifa->ifa_addr->sa_family != AF_PACKET)
+            continue;
+        if (strcmp(ifa->ifa_name, "lo") == 0)
+            continue;
+        if (count >= MAX_IFACES)
+            break;
+
+        struct sockaddr_ll *sll = (struct sockaddr_ll *)ifa->ifa_addr;
+
+        strncpy(ifaces[count].name, ifa->ifa_name, IF_NAMESIZE - 1);
+        ifaces[count].ifindex = sll->sll_ifindex;
+        memcpy(ifaces[count].mac, sll->sll_addr, 6);
+        count++;
+    }
+
+    freeifaddrs(addrs);
+    return count;
+}
+
+/*
+Handle activity on the raw AF_PACKET socket: receive one Ethernet
+frame, and print which interface it arrived on.
+*/
+void handle_raw_socket(int sd_raw, int debug)
+{
+    uint8_t buf[1514];
+    struct sockaddr_ll src_addr;
+    socklen_t addr_len = sizeof(src_addr);
+
+    ssize_t n = recvfrom(
+        sd_raw, 
+        buf, 
+        sizeof(buf), 
+        0, 
+        (struct sockaddr *)&src_addr, 
+        &addr_len
+    );
+
+    if (n == -1) {
+        perror("recvfrom");
+        return;
+    }
+
+    if (n < (ssize_t)sizeof(struct ethhdr)) {
+        fprintf(stderr, "Frame too short to contain an Ethernet header\n");
+        return;
+    }
+
+    struct ethhdr *eth = (struct ethhdr *)buf;
+
+    if (ntohs(eth->h_proto) != ETH_P_MIP) {
+        return;
+    }
+
+    uint8_t *mip_hdr_start = buf + sizeof(struct ethhdr);
+    uint8_t dst, src, ttl, sdu_type;
+    uint16_t sdu_len;
+
+    mip_unpack_header(mip_hdr_start, &dst, &src, &ttl, &sdu_len, &sdu_type);
+
+    uint8_t *sdu = mip_hdr_start + MIP_HEADER_LEN;
+    size_t sdu_len_bytes = sdu_len * 4;
+
+    size_t expected_len = sizeof(struct ethhdr) + 4 + sdu_len_bytes;
+    if ((size_t)n < expected_len) {
+        fprintf(stderr, "Frame shorter than SDU length claims\n");
+        return;
+    }
+
+    if (debug) {
+        printf("Ethernet: src=%02x:%02x:%02x:%02x:%02x:%02x dst=%02x:%02x:%02x:%02x:%02x:%02x\n",
+               eth->h_source[0], eth->h_source[1], eth->h_source[2],
+               eth->h_source[3], eth->h_source[4], eth->h_source[5],
+               eth->h_dest[0], eth->h_dest[1], eth->h_dest[2],
+               eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
+        printf("MIP: src=%u dst=%u ttl=%u sdu_type=%u sdu_len=%zu bytes, from ifindex=%d\n",
+               src, dst, ttl, sdu_type, sdu_len_bytes, src_addr.sll_ifindex);
+    }
+
+    if (sdu_type == MIP_TYPE_ARP) {
+        
+    } else if (sdu_type == MIP_TYPE_PING) {
+        
+    } else {
+        if (debug)
+            printf("Unknown SDU type %u, ignoring\n", sdu_type);
+    }
+
+    (void)sdu;
+}
+
+/*
+Build a MIP frame (Ethernet header + MIP header + SDU) and send
+it on the given raw socket and interface.
+
+Returns 0 on success, -1 on failure with errno set (EINVAL for
+bad arguments or misaligned SDU length, EMSGSIZE if the frame or
+SDU length is too large, EIO if sendto() sent fewer bytes than
+expected, or an error from sendto() itself).
+*/
+int send_mip_frame(int sd_raw, int ifindex,
+                   const uint8_t *src_mac, const uint8_t *dest_mac,
+                   uint8_t mip_dst, uint8_t mip_src, uint8_t ttl,
+                   uint8_t sdu_type, const uint8_t *sdu,
+                   size_t sdu_len_bytes)
+{
+    uint8_t frame[1514];
+    size_t offset = 0;
+
+    if (src_mac == NULL || dest_mac == NULL ||
+        (sdu == NULL && sdu_len_bytes != 0)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (ifindex <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    /*
+     * The MIP SDU length field counts 32-bit words, rather than bytes.
+     * Therefore all SDUs must have a length divisible by four bytes.
+     */
+    if (sdu_len_bytes % 4 != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    size_t frame_len = sizeof(struct ethhdr) +
+                       MIP_HEADER_LEN +
+                       sdu_len_bytes;
+
+    if (frame_len > sizeof(frame)) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+
+    size_t sdu_len_words_size = sdu_len_bytes / 4;
+
+    /*
+     * mip_pack_header() takes uint16_t. Check before conversion so a
+     * too-large value cannot silently wrap around.
+     */
+    if (sdu_len_words_size > UINT16_MAX) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+
+    uint16_t sdu_len_words = (uint16_t)sdu_len_words_size;
+
+    /* Build Ethernet header. */
+    struct ethhdr *eth = (struct ethhdr *)frame;
+
+    memcpy(eth->h_dest, dest_mac, ETH_ALEN);
+    memcpy(eth->h_source, src_mac, ETH_ALEN);
+    eth->h_proto = htons(ETH_P_MIP);
+
+    offset += sizeof(struct ethhdr);
+
+    /* Build the four-byte MIP header. */
+    mip_pack_header(frame + offset,
+                    mip_dst,
+                    mip_src,
+                    ttl,
+                    sdu_len_words,
+                    sdu_type);
+
+    offset += MIP_HEADER_LEN;
+
+    /* Append SDU only when it has content. */
+    if (sdu_len_bytes > 0) {
+        memcpy(frame + offset, sdu, sdu_len_bytes);
+        offset += sdu_len_bytes;
+    }
+
+    /*
+     * sockaddr_ll specifies the Ethernet interface and destination
+     * link-layer address used by the AF_PACKET socket.
+     */
+    struct sockaddr_ll dest_addr;
+    memset(&dest_addr, 0, sizeof(dest_addr));
+
+    dest_addr.sll_family = AF_PACKET;
+    dest_addr.sll_protocol = htons(ETH_P_MIP);
+    dest_addr.sll_ifindex = ifindex;
+    dest_addr.sll_halen = ETH_ALEN;
+    memcpy(dest_addr.sll_addr, dest_mac, ETH_ALEN);
+
+    ssize_t sent = sendto(sd_raw, frame, offset, 0,
+                          (struct sockaddr *)&dest_addr,
+                          sizeof(dest_addr));
+
+    if (sent == -1) {
+        return -1;
+    }
+
+    /*
+     * AF_PACKET/SOCK_RAW normally either transmits all bytes or returns
+     * an error, but checking makes the function robust.
+     */
+    if ((size_t)sent != offset) {
+        errno = EIO;
+        return -1;
+    }
+
+    return 0;
+}
+
+
+/*
 Run MIP daemon's main event loop.
 
 Waits for activity on the listening upper-layer UNIX socket and, 
@@ -122,9 +353,7 @@ void run_daemon(int sd_upper, int sd_raw, int debug) {
 
         /* Raw Ethernet frame has arrived */
         if (fds[1].revents & POLLIN) {
-            uint8_t raw_buf[1514];
-            ssize_t n = recv(sd_raw, raw_buf, sizeof(raw_buf), 0);
-            printf("Received %zd bytes on raw socket\n", n);
+            handle_raw_socket(sd_raw, debug);
         }
 
         /* Connected client has sent something */
@@ -149,49 +378,6 @@ void run_daemon(int sd_upper, int sd_raw, int debug) {
             }
         }
     }
-}
-
-/*
-Discover all Ethernet interfaces (excluding loopback) on this host.
-Returns the number of interfaces found, written into ifaces[0..n-1].
-Exits the program on fatal error (getifaddrs failure).
-*/
-int discover_interfaces(struct mip_iface *ifaces)
-{
-    struct ifaddrs *addrs, *ifa;
-    int count = 0;
-
-    if (getifaddrs(&addrs) == -1) {
-        perror("getifaddrs");
-        exit(1);
-    }
-
-    for (ifa = addrs; ifa != NULL; ifa = ifa->ifa_next) {
-        if (ifa->ifa_addr == NULL)
-            continue;
-        if (ifa->ifa_addr->sa_family != AF_PACKET)
-            continue;
-        if (strcmp(ifa->ifa_name, "lo") == 0)
-            continue;
-        if (count >= MAX_IFACES)
-            break;
-
-        struct sockaddr_ll *sll = (struct sockaddr_ll *)ifa->ifa_addr;
-
-        strncpy(ifaces[count].name, ifa->ifa_name, IF_NAMESIZE - 1);
-        ifaces[count].ifindex = sll->sll_ifindex;
-        memcpy(ifaces[count].mac, sll->sll_addr, 6);
-        count++;
-    }
-
-    freeifaddrs(addrs);
-    return count;
-}
-
-int handle_raw_socket(int sd_raw, int debug) {
-
-    char* message = recvfrom(sd_raw)
-    printf(message)
 }
 
 
@@ -251,6 +437,7 @@ int main(int argc, char *argv[]) {
 
     if (debug)
         printf("Raw socket created (fd=%d)\n", sd_raw);
+
 
     run_daemon(sd_upper, sd_raw, debug);
 
