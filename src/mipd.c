@@ -188,6 +188,12 @@ int discover_interfaces(struct mip_iface *ifaces)
     return count;
 }
 
+int handle_raw_socket(int sd_raw, int debug) {
+
+    char* message = recvfrom(sd_raw)
+    printf(message)
+}
+
 
 /*
 Entry point for MIP daemon.
