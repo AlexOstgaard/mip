@@ -12,6 +12,7 @@
 #include <arpa/inet.h>
 #include <linux/if_ether.h>
 #include <errno.h>
+#include "mip_arp.h"
 
 
 /*
@@ -437,7 +438,6 @@ int main(int argc, char *argv[]) {
 
     if (debug)
         printf("Raw socket created (fd=%d)\n", sd_raw);
-
 
     run_daemon(sd_upper, sd_raw, debug);
 

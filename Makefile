@@ -3,7 +3,7 @@ CFLAGS  = -Wall -Wextra -Iinclude -g
 
 SRC     = src
 BIN_ALL = mipd ping_server ping_client
-BIN_TEST = test_header test_client
+BIN_TEST = test_header test_client test_arp
 
 all: $(BIN_ALL)
 
@@ -21,6 +21,9 @@ test_header: tests/test_header.c $(SRC)/mip.c include/mip.h
 
 test_client: tests/test_client.c
 	$(CC) $(CFLAGS) -o $@ tests/test_client.c
+
+test_arp: tests/test_arp.c $(SRC)/mip_arp.c include/mip_arp.h
+	$(CC) $(CFLAGS) -o $@ tests/test_arp.c $(SRC)/mip_arp.c
 
 clean:
 	rm -f $(BIN_ALL) $(BIN_TEST)
