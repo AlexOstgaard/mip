@@ -7,8 +7,8 @@ BIN_TEST = test_header test_client test_arp
 
 all: $(BIN_ALL)
 
-mipd: $(SRC)/mipd.c $(SRC)/mip.c include/mip.h
-	$(CC) $(CFLAGS) -o $@ $(SRC)/mipd.c $(SRC)/mip.c
+mipd: $(SRC)/mipd.c $(SRC)/mip.c $(SRC)/mip_arp.c include/mip.h include/mip_arp.h
+	$(CC) $(CFLAGS) -o $@ $(SRC)/mipd.c $(SRC)/mip.c $(SRC)/mip_arp.c
 
 ping_server: $(SRC)/ping_server.c
 	$(CC) $(CFLAGS) -o $@ $

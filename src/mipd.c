@@ -119,7 +119,7 @@ int discover_interfaces(struct mip_iface *ifaces)
 Handle activity on the raw AF_PACKET socket: receive one Ethernet
 frame, and print which interface it arrived on.
 */
-void handle_raw_socket(int sd_raw, int debug)
+void handle_raw_socket(int sd_raw, int debug, struct arp_entry *cache, uint8_t my_mip_addr)
 {
     uint8_t buf[1514];
     struct sockaddr_ll src_addr;
@@ -176,9 +176,26 @@ void handle_raw_socket(int sd_raw, int debug)
     }
 
     if (sdu_type == MIP_TYPE_ARP) {
-        
+        uint8_t arp_type, arp_addr;
+        mip_arp_unpack(sdu, &arp_type, &arp_addr);
+
+        if (arp_type == MIP_ARP_REQUEST) {
+            if (arp_addr == my_mip_addr) {
+                arp_cache_insert(cache, src, eth->h_source, src_addr.sll_ifindex);
+
+                uint8_t response_sdu[4];
+                mip_arp_pack(response_sdu, MIP_ARP_RESPONSE, my_mip_addr);
+
+                send_mip_frame(sd_raw, src_addr.sll_ifindex,
+                              eth->h_dest, eth->h_source,
+                              src, my_mip_addr, 1,
+                              MIP_TYPE_ARP, response_sdu, sizeof(response_sdu));
+            }
+        } else if (arp_type == MIP_ARP_RESPONSE) {
+            arp_cache_insert(cache, src, eth->h_source, src_addr.sll_ifindex);
+        }
     } else if (sdu_type == MIP_TYPE_PING) {
-        
+        /* kommer senere */
     } else {
         if (debug)
             printf("Unknown SDU type %u, ignoring\n", sdu_type);
@@ -315,7 +332,7 @@ Accepts new client connections, and reads and prints messages received from the 
 Only one upper-layer client is supported at a time, per the assignment specification.
 Once a client disconnects, the daemon goes back to waiting for a new connection.
 */
-void run_daemon(int sd_upper, int sd_raw, int debug) {
+void run_daemon(int sd_upper, int sd_raw, int debug, struct arp_entry *cache, uint8_t my_mip_addr) {
 
     int client_sd = -1;
 
@@ -354,7 +371,7 @@ void run_daemon(int sd_upper, int sd_raw, int debug) {
 
         /* Raw Ethernet frame has arrived */
         if (fds[1].revents & POLLIN) {
-            handle_raw_socket(sd_raw, debug);
+            handle_raw_socket(sd_raw, debug, cache, my_mip_addr);
         }
 
         /* Connected client has sent something */
@@ -439,7 +456,10 @@ int main(int argc, char *argv[]) {
     if (debug)
         printf("Raw socket created (fd=%d)\n", sd_raw);
 
-    run_daemon(sd_upper, sd_raw, debug);
+    
+    struct arp_entry arp_cache[ARP_CACHE_SIZE] = {0};
+
+    run_daemon(sd_upper, sd_raw, debug, arp_cache, (uint8_t)mip_address);
 
     return 0;
 }

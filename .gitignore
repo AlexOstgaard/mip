@@ -3,6 +3,8 @@ mipd
 ping_server
 ping_client
 test_header
+test_client
+test_arp
 
 # Object files
 *.o
