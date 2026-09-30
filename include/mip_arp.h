@@ -79,6 +79,21 @@ void arp_cache_insert(struct arp_entry *cache, uint8_t mip_addr,
 
 
 /**
+ * Print the current contents of the MIP-ARP cache.
+ *
+ * cache: Array containing ARP_CACHE_SIZE struct arp_entry elements.
+ *
+ * Every valid MIP-to-MAC mapping is printed with its MIP address,
+ * Ethernet MAC address, and outgoing interface index. If the cache
+ * has no valid entries, an empty-cache message is printed.
+ *
+ * This function does not allocate memory or modify cache. It does not
+ * return a value and does not use global variables.
+ */
+void arp_cache_print(const struct arp_entry *cache);
+
+
+/**
  * Serialize a MIP-ARP message into its four-byte SDU representation.
  *
  * buf: Output buffer for the serialized MIP-ARP message. It must have

@@ -14,6 +14,32 @@
 #include <errno.h>
 #include "mip_arp.h"
 
+/*
+ * Maximum SDU size that fits in the local Ethernet frame buffer:
+ *
+ * 1514 bytes total frame size
+ * - 14 bytes Ethernet header
+ * - 4 bytes MIP header
+ * = 1496 bytes SDU
+ */
+#define MAX_PING_SDU_LEN 1496
+
+/**
+ * Stores one Ping SDU while the daemon waits for a MIP-ARP response.
+ *
+ * valid: Non-zero when this structure contains a pending Ping packet.
+ * dst_mip: MIP address of the intended Ping recipient.
+ * payload: Ping SDU received from the upper-layer client.
+ * payload_len: Number of valid bytes in payload.
+ */
+struct pending_ping {
+    int valid;
+    uint8_t dst_mip;
+    uint8_t payload[MAX_PING_SDU_LEN];
+    size_t payload_len;
+};
+
+
 
 /**
  * Print command-line usage information for the MIP daemon.
@@ -229,8 +255,11 @@ int discover_interfaces(struct mip_iface *ifaces)
  * messages, but does not use global variables.
  */
 void handle_raw_socket(int sd_raw, int client_sd, int debug,
-                       struct arp_entry *cache, uint8_t my_mip_addr,
+                       struct arp_entry *cache,
+                       struct pending_ping *pending,
+                       uint8_t my_mip_addr,
                        const struct mip_iface *ifaces, int n_ifaces)
+
 {
     uint8_t buf[1514];
     struct sockaddr_ll src_addr;
@@ -297,6 +326,10 @@ void handle_raw_socket(int sd_raw, int client_sd, int debug,
             if (arp_addr == my_mip_addr) {
                 arp_cache_insert(cache, src, eth->h_source, src_addr.sll_ifindex);
 
+                if (debug) {
+                    arp_cache_print(cache);
+                }
+
                 uint8_t my_mac[6];
                 if (find_mac_by_ifindex(ifaces, n_ifaces, src_addr.sll_ifindex, my_mac)) {
                     uint8_t response_sdu[4];
@@ -313,6 +346,45 @@ void handle_raw_socket(int sd_raw, int client_sd, int debug,
             }
         } else if (arp_type == MIP_ARP_RESPONSE) {
             arp_cache_insert(cache, src, eth->h_source, src_addr.sll_ifindex);
+        
+            if (debug) {
+                arp_cache_print(cache);
+            }
+            /*
+             * If this ARP response is for the MIP address of the saved Ping,
+             * transmit the saved packet now.
+             */
+            if (pending->valid && pending->dst_mip == src) {
+                uint8_t my_mac[6];
+            
+                if (!find_mac_by_ifindex(ifaces, n_ifaces,
+                                         src_addr.sll_ifindex, my_mac)) {
+                    fprintf(stderr,
+                            "No local interface found for ARP response interface\n");
+                    return;
+                }
+            
+                if (send_mip_frame(sd_raw, src_addr.sll_ifindex,
+                                   my_mac, eth->h_source,
+                                   pending->dst_mip, my_mip_addr, 1,
+                                   MIP_TYPE_PING,
+                                   pending->payload,
+                                   pending->payload_len) == -1) {
+                    perror("send pending MIP Ping frame");
+                    return;
+                }
+            
+                /*
+                 * The Ping was sent successfully. Clear it immediately, so a
+                 * duplicate ARP response cannot trigger another transmission.
+                 */
+                pending->valid = 0;
+            
+                if (debug) {
+                    printf("Sent pending Ping to MIP address %u after ARP response\n",
+                           pending->dst_mip);
+                }
+            }
         }
     } else if (sdu_type == MIP_TYPE_PING) {
         /*
@@ -534,8 +606,9 @@ int send_mip_frame(int sd_raw, int ifindex,
  * local client socket descriptor while the event loop runs. It does not
  * allocate dynamic memory or use global variables.
  */
-void run_daemon(int sd_upper, int sd_raw, int debug, struct arp_entry *cache,
-               uint8_t my_mip_addr, struct mip_iface *ifaces, int n_ifaces) {
+void run_daemon(int sd_upper, int sd_raw, int debug,
+                struct arp_entry *cache, struct pending_ping *pending,
+                uint8_t my_mip_addr, struct mip_iface *ifaces, int n_ifaces) {
 
     int client_sd = -1;
 
@@ -574,9 +647,8 @@ void run_daemon(int sd_upper, int sd_raw, int debug, struct arp_entry *cache,
 
         /* Raw Ethernet frame has arrived */
         if (fds[1].revents & POLLIN) {
-            handle_raw_socket(sd_raw, client_sd, debug, cache,
+            handle_raw_socket(sd_raw, client_sd, debug, cache, pending,
                               my_mip_addr, ifaces, n_ifaces);
-
         }
 
         /* Connected client has sent something */
@@ -646,10 +718,23 @@ void run_daemon(int sd_upper, int sd_raw, int debug, struct arp_entry *cache,
                         perror("send MIP Ping frame");
                     }
                 } else {
-                    /*
-                     * No MIP-ARP mapping exists yet. Broadcast an ARP request on every
-                     * discovered Ethernet interface.
-                     */
+                    
+                    if (pending->valid) {
+                        fprintf(stderr,
+                                "Already waiting for an ARP response; dropping Ping packet\n");
+                        continue;
+                    }
+                
+                    if (payload_len > sizeof(pending->payload)) {
+                        fprintf(stderr, "Ping payload is too large\n");
+                        continue;
+                    }
+                
+                    pending->dst_mip = dest_mip;
+                    pending->payload_len = payload_len;
+                    memcpy(pending->payload, payload, payload_len);
+                    pending->valid = 1;
+                
                     uint8_t broadcast_mac[6] = {
                         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
                     };
@@ -757,8 +842,10 @@ int main(int argc, char *argv[]) {
 
     
     struct arp_entry arp_cache[ARP_CACHE_SIZE] = {0};
+    struct pending_ping pending = {0};
 
-    run_daemon(sd_upper, sd_raw, debug, arp_cache, (uint8_t)mip_address, ifaces, n_ifaces);
+    run_daemon(sd_upper, sd_raw, debug, arp_cache, &pending,
+               (uint8_t)mip_address, ifaces, n_ifaces);
 
     return 0;
 }

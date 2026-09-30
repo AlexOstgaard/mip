@@ -11,10 +11,10 @@ mipd: $(SRC)/mipd.c $(SRC)/mip.c $(SRC)/mip_arp.c include/mip.h include/mip_arp.
 	$(CC) $(CFLAGS) -o $@ $(SRC)/mipd.c $(SRC)/mip.c $(SRC)/mip_arp.c
 
 ping_server: $(SRC)/ping_server.c
-	$(CC) $(CFLAGS) -o $@ $
+	$(CC) $(CFLAGS) -o $@ $(SRC)/ping_server.c
 
 ping_client: $(SRC)/ping_client.c
-	$(CC) $(CFLAGS) -o $@ $
+	$(CC) $(CFLAGS) -o $@ $(SRC)/ping_client.c
 
 test_header: tests/test_header.c $(SRC)/mip.c include/mip.h
 	$(CC) $(CFLAGS) -o $@ tests/test_header.c $(SRC)/mip.c
