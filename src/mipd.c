@@ -128,7 +128,7 @@ int setup_raw_socket(void) {
  * variables. The caller must provide valid pointers and a non-negative
  * n_ifaces value.
  */
-int find_mac_by_ifindex(struct mip_iface *ifaces, int n_ifaces,
+int find_mac_by_ifindex(const struct mip_iface *ifaces, int n_ifaces,
                         int ifindex, uint8_t *out_mac)
 {
     for (int i = 0; i < n_ifaces; i++) {
@@ -139,6 +139,7 @@ int find_mac_by_ifindex(struct mip_iface *ifaces, int n_ifaces,
     }
     return 0;
 }
+
 
 
 /**
@@ -184,9 +185,12 @@ int discover_interfaces(struct mip_iface *ifaces)
         struct sockaddr_ll *sll = (struct sockaddr_ll *)ifa->ifa_addr;
 
         strncpy(ifaces[count].name, ifa->ifa_name, IF_NAMESIZE - 1);
+        ifaces[count].name[IF_NAMESIZE - 1] = '\0';
+
         ifaces[count].ifindex = sll->sll_ifindex;
         memcpy(ifaces[count].mac, sll->sll_addr, 6);
         count++;
+
     }
 
     freeifaddrs(addrs);
@@ -214,14 +218,19 @@ int discover_interfaces(struct mip_iface *ifaces)
  * response on the interface on which the request arrived. MIP-ARP
  * responses cause the sender mapping to be inserted into cache.
  *
- * Ping SDUs are currently recognized but not processed.
+ * Ping SDUs addressed to my_mip_addr are delivered to the connected
+ * upper-layer client as one source MIP address byte followed by the SDU.
+ * Ping SDUs for other MIP addresses are ignored because this daemon does
+ * not implement packet forwarding.
+
  *
  * This function returns no value. Receive errors and malformed frames are
  * reported to stderr and ignored. It modifies cache when processing ARP
  * messages, but does not use global variables.
  */
-void handle_raw_socket(int sd_raw, int debug, struct arp_entry *cache,
-                       uint8_t my_mip_addr, struct mip_iface *ifaces, int n_ifaces)
+void handle_raw_socket(int sd_raw, int client_sd, int debug,
+                       struct arp_entry *cache, uint8_t my_mip_addr,
+                       const struct mip_iface *ifaces, int n_ifaces)
 {
     uint8_t buf[1514];
     struct sockaddr_ll src_addr;
@@ -235,10 +244,11 @@ void handle_raw_socket(int sd_raw, int debug, struct arp_entry *cache,
         return;
     }
 
-    if (n < (ssize_t)sizeof(struct ethhdr)) {
-        fprintf(stderr, "Frame too short to contain an Ethernet header\n");
+    if (n < (ssize_t)(sizeof(struct ethhdr) + MIP_HEADER_LEN)) {
+        fprintf(stderr, "Frame too short to contain Ethernet and MIP headers\n");
         return;
     }
+
 
     struct ethhdr *eth = (struct ethhdr *)buf;
 
@@ -272,6 +282,14 @@ void handle_raw_socket(int sd_raw, int debug, struct arp_entry *cache,
     }
 
     if (sdu_type == MIP_TYPE_ARP) {
+        if (sdu_len_bytes != 4) {
+            if (debug) {
+                printf("Ignoring MIP-ARP SDU with invalid length %zu bytes\n",
+                       sdu_len_bytes);
+            }
+            return;
+        }
+
         uint8_t arp_type, arp_addr;
         mip_arp_unpack(sdu, &arp_type, &arp_addr);
 
@@ -297,7 +315,45 @@ void handle_raw_socket(int sd_raw, int debug, struct arp_entry *cache,
             arp_cache_insert(cache, src, eth->h_source, src_addr.sll_ifindex);
         }
     } else if (sdu_type == MIP_TYPE_PING) {
-        /* kommer senere */
+        /*
+        * This daemon does not route packets. Only accept Ping messages
+        * addressed directly to this host.
+        */ 
+        if (dst != my_mip_addr) {
+            if (debug) {
+                printf("Ignoring Ping for MIP address %u\n", dst);
+            }
+            return;
+        }
+
+        if (client_sd == -1) {
+            if (debug) {
+                printf("No upper-layer client connected; dropping Ping\n");
+            }
+            return;
+        }
+
+        uint8_t upper_msg[1500];
+
+        if (sdu_len_bytes + 1 > sizeof(upper_msg)) {
+            fprintf(stderr, "Ping SDU too large for upper-layer buffer\n");
+            return;
+        }
+
+        /*
+        * Message format toward upper layer:
+        * one source MIP address byte followed by the received SDU.
+        */
+        upper_msg[0] = src;
+        memcpy(upper_msg + 1, sdu, sdu_len_bytes);
+
+        ssize_t sent = send(client_sd, upper_msg, sdu_len_bytes + 1, 0);
+        if (sent == -1) {
+            perror("send to upper layer");
+        } else if ((size_t)sent != sdu_len_bytes + 1) {
+            fprintf(stderr, "Incomplete message sent to upper layer\n");
+        }
+
     } else {
         if (debug)
             printf("Unknown SDU type %u, ignoring\n", sdu_type);
@@ -382,10 +438,11 @@ int send_mip_frame(int sd_raw, int ifindex,
      * mip_pack_header() takes uint16_t. Check before conversion so a
      * too-large value cannot silently wrap around.
      */
-    if (sdu_len_words_size > UINT16_MAX) {
+    if (sdu_len_words_size > MIP_MAX_SDU_WORDS) {
         errno = EMSGSIZE;
         return -1;
     }
+
 
     uint16_t sdu_len_words = (uint16_t)sdu_len_words_size;
 
@@ -465,10 +522,10 @@ int send_mip_frame(int sd_raw, int ifindex,
  * client socket. It accepts one upper-layer client at a time.
  *
  * Incoming raw Ethernet frames are passed to handle_raw_socket().
- * Messages received from the upper-layer client are currently decoded as
- * one destination MIP address followed by an SDU payload and printed to
- * stdout. Outgoing MIP transmission from upper-layer messages is not yet
- * implemented in the current version.
+ * Messages received from the upper-layer client consist of one destination
+ * MIP address byte followed by an SDU payload. If the destination has a
+ * cached MIP-ARP mapping, the payload is transmitted as a MIP Ping frame.
+ * Otherwise, the daemon broadcasts a MIP-ARP request for the destination.
  *
  * The function normally runs indefinitely and returns only if poll()
  * fails. A poll() failure is reported with perror().
@@ -517,7 +574,9 @@ void run_daemon(int sd_upper, int sd_raw, int debug, struct arp_entry *cache,
 
         /* Raw Ethernet frame has arrived */
         if (fds[1].revents & POLLIN) {
-            handle_raw_socket(sd_raw, debug, cache, my_mip_addr, ifaces, n_ifaces);
+            handle_raw_socket(sd_raw, client_sd, debug, cache,
+                              my_mip_addr, ifaces, n_ifaces);
+
         }
 
         /* Connected client has sent something */
@@ -534,11 +593,90 @@ void run_daemon(int sd_upper, int sd_raw, int debug, struct arp_entry *cache,
                 close(client_sd);
                 client_sd = -1;
             } else {
+                /*
+                 * The first byte received from the upper layer is the
+                 * destination MIP address. The remaining bytes are the SDU.
+                 */
+                if (n < 1) {
+                    fprintf(stderr, "Received empty message from upper layer\n");
+                    continue;
+                }
+
                 uint8_t dest_mip = buf[0];
                 uint8_t *payload = &buf[1];
-                size_t payload_len = n - 1;
-                printf("Received message for/from MIP address %u, %zu bytes payload: %.*s\n",
-                    dest_mip, payload_len, (int)payload_len, payload);
+                size_t payload_len = (size_t)n - 1;
+
+                /*
+                 * The MIP header stores the SDU length in 32-bit words.
+                 * Therefore the supplied SDU must have a byte length divisible
+                 * by four.
+                 */
+                if (payload_len % 4 != 0) {
+                    fprintf(stderr,
+                            "Upper-layer payload length must be divisible by 4 bytes\n");
+                    continue;
+                }
+
+                if (debug) {
+                    printf("Received upper-layer message for MIP address %u, "
+                            "%zu bytes payload: %.*s\n",
+                            dest_mip, payload_len, (int)payload_len, payload);
+                }
+
+                uint8_t dest_mac[6];
+                int out_ifindex;
+
+                /*
+                 * A cached mapping allows the Ping SDU to be sent immediately.
+                 */
+                if (arp_cache_lookup(cache, dest_mip, dest_mac, &out_ifindex)) {
+                    uint8_t src_mac[6];
+
+                    if (!find_mac_by_ifindex(ifaces, n_ifaces,
+                                             out_ifindex, src_mac)) {
+                        fprintf(stderr,
+                                "No local interface found for cached ARP entry\n");
+                        continue;
+                    }
+
+                    if (send_mip_frame(sd_raw, out_ifindex,
+                                       src_mac, dest_mac,
+                                       dest_mip, my_mip_addr, 1,
+                                        MIP_TYPE_PING, payload, payload_len) == -1) {
+                        perror("send MIP Ping frame");
+                    }
+                } else {
+                    /*
+                     * No MIP-ARP mapping exists yet. Broadcast an ARP request on every
+                     * discovered Ethernet interface.
+                     */
+                    uint8_t broadcast_mac[6] = {
+                        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+                    };
+
+                    uint8_t arp_sdu[4];
+                    mip_arp_pack(arp_sdu, MIP_ARP_REQUEST, dest_mip);
+
+                    if (debug) {
+                        printf("No MIP-ARP cache entry for MIP address %u; "
+                                "broadcasting ARP request\n",
+                            dest_mip);
+                    }
+
+                    for (int i = 0; i < n_ifaces; i++) {
+                        if (send_mip_frame(sd_raw, ifaces[i].ifindex,
+                                           ifaces[i].mac, broadcast_mac,
+                                           MIP_BROADCAST, my_mip_addr, 1,
+                                           MIP_TYPE_ARP, arp_sdu, sizeof(arp_sdu)) == -1) {
+                            perror("send MIP-ARP request");
+                        }
+                    }
+
+                    /*
+                     * The original Ping SDU must be saved here so it can be transmitted
+                     * when a matching MIP-ARP response is received.
+                     */
+                }
             }
         }
     }

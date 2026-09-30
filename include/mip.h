@@ -27,6 +27,9 @@
 
 #define MIP_HEADER_LEN 4
 
+#define MIP_MAX_SDU_WORDS 0x01FF
+
+
 /* Represent one Ethernet interface on this host */
 struct mip_iface {
     char name[IF_NAMESIZE];
@@ -78,7 +81,7 @@ void mip_pack_header(uint8_t *buf, uint8_t dst, uint8_t src,
 void mip_unpack_header(const uint8_t *buf, uint8_t *dst, uint8_t *src,
                        uint8_t *ttl, uint16_t *sdu_len, uint8_t *sdu_type);
 
-                       
+
 /**
  * Discover available Ethernet interfaces on the local host.
  *
