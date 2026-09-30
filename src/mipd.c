@@ -15,23 +15,43 @@
 #include "mip_arp.h"
 
 
-/*
- Print usage information to stderr. 
- prog-parameter is the program's own name (argv[0]), 
- used so the message matches however the program was invoked. No return value.
+/**
+ * Print command-line usage information for the MIP daemon.
+ *
+ * prog: Program name, normally argv[0]. The value is included in the
+ *       printed usage line so that the message reflects how the program
+ *       was invoked.
+ *
+ * The usage message is written to stderr.
+ *
+ * This function does not allocate memory, return a value, or modify
+ * global variables.
  */
 static void print_usage(const char *prog) {
     fprintf(stderr, "Usage: %s [-h] [-d] <socket_upper> <MIP address>\n", prog);
 }
 
 
-/*
- Create and bind a UNIX domain socket for communication with the upper layer applications.
- path-parameter is for the filesystem path to bind the socket to. 
- Any existing file at this path is removed first.
- * Returns the socket descriptor.
+/**
+ * Create, bind, and listen on the UNIX domain socket used by upper-layer
+ * applications to communicate with the MIP daemon.
+ *
+ * path: Filesystem path at which the UNIX domain socket is created.
+ *       Any existing filesystem entry at this path is removed before
+ *       binding the new socket.
+ *
+ * The created socket uses AF_UNIX and SOCK_SEQPACKET. The socket is put
+ * into listening mode with a backlog of one client, because this
+ * assignment supports only one upper-layer process at a time.
+ *
+ * Returns the listening socket file descriptor on success.
+ *
+ * If socket(), bind(), or listen() fails, an error message is printed
+ * with perror() and the entire process terminates with exit status 1.
+ *
+ * This function modifies the filesystem by unlinking path when it
+ * exists. It does not allocate dynamic memory or use global variables.
  */
-
 int setup_unix_socket(const char *path)
 {
     unlink(path);
@@ -61,10 +81,22 @@ int setup_unix_socket(const char *path)
     return sd;
 }
 
-/* 
-Create a raw AF_PACKET socket for sending and receiving 
-Ethernet frames with the MIP ethertype, on all interfaces.
-*/
+/**
+ * Create a raw Ethernet socket for receiving and transmitting MIP frames.
+ *
+ * The socket is created in the AF_PACKET domain with SOCK_RAW and is
+ * configured for Ethernet frames with Ethertype ETH_P_MIP.
+ *
+ * Returns the raw socket file descriptor on success.
+ *
+ * If the socket cannot be created, for example because the process lacks
+ * the CAP_NET_RAW capability or root privileges, perror() is called and
+ * the entire process terminates with exit status 1.
+ *
+ * The returned file descriptor is owned by the caller and should be
+ * closed when it is no longer needed. This function does not allocate
+ * memory or use global variables.
+ */
 int setup_raw_socket(void) {
 
     int sd_raw = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_MIP));
@@ -77,12 +109,58 @@ int setup_raw_socket(void) {
     return sd_raw;
 }
 
+/**
+ * Find the local MAC address associated with an interface index.
+ *
+ * ifaces: Array of discovered local Ethernet interfaces.
+ * n_ifaces: Number of valid entries in ifaces.
+ * ifindex: System interface index to search for.
+ * out_mac: Output buffer that receives the matching six-byte MAC address.
+ *          The buffer must have room for at least six bytes.
+ *
+ * Returns 1 when an interface with ifindex is found. Its MAC address is
+ * copied to out_mac.
+ *
+ * Returns 0 when no matching interface exists. out_mac is not modified
+ * in that case.
+ *
+ * This function does not allocate memory, modify ifaces, or use global
+ * variables. The caller must provide valid pointers and a non-negative
+ * n_ifaces value.
+ */
+int find_mac_by_ifindex(struct mip_iface *ifaces, int n_ifaces,
+                        int ifindex, uint8_t *out_mac)
+{
+    for (int i = 0; i < n_ifaces; i++) {
+        if (ifaces[i].ifindex == ifindex) {
+            memcpy(out_mac, ifaces[i].mac, 6);
+            return 1;
+        }
+    }
+    return 0;
+}
 
-/*
-Discover all Ethernet interfaces (excluding loopback) on this host.
-Returns the number of interfaces found, written into ifaces[0..n-1].
-Exits the program on fatal error (getifaddrs failure).
-*/
+
+/**
+ * Discover local Ethernet interfaces, excluding the loopback interface.
+ *
+ * ifaces: Output array that receives discovered interface information.
+ *         The array must have room for at least MAX_IFACES entries.
+ *
+ * For every discovered AF_PACKET interface, the function stores its name,
+ * interface index, and six-byte Ethernet MAC address in ifaces. At most
+ * MAX_IFACES interfaces are stored; any additional interfaces are
+ * ignored.
+ *
+ * Returns the number of interfaces stored in ifaces.
+ *
+ * If getifaddrs() fails, perror() is called and the entire process
+ * terminates with exit status 1.
+ *
+ * This function allocates no memory directly, but uses getifaddrs(),
+ * whose result is released with freeifaddrs() before returning. It does
+ * not use global variables.
+ */
 int discover_interfaces(struct mip_iface *ifaces)
 {
     struct ifaddrs *addrs, *ifa;
@@ -115,24 +193,42 @@ int discover_interfaces(struct mip_iface *ifaces)
     return count;
 }
 
-/*
-Handle activity on the raw AF_PACKET socket: receive one Ethernet
-frame, and print which interface it arrived on.
-*/
-void handle_raw_socket(int sd_raw, int debug, struct arp_entry *cache, uint8_t my_mip_addr)
+/**
+ * Receive and process one MIP Ethernet frame from the raw socket.
+ *
+ * sd_raw: Raw AF_PACKET socket from which the Ethernet frame is received
+ *         and through which an ARP response may be transmitted.
+ * debug: Non-zero enables diagnostic output about received Ethernet and
+ *        MIP headers.
+ * cache: MIP-ARP cache to update when ARP traffic is received.
+ * my_mip_addr: MIP address assigned to this local daemon.
+ * ifaces: Array of local Ethernet interface descriptions.
+ * n_ifaces: Number of valid entries in ifaces.
+ *
+ * The function receives one Ethernet frame, verifies that it has MIP
+ * Ethertype ETH_P_MIP, decodes the MIP header, and verifies that the
+ * received frame contains the SDU length claimed by that header.
+ *
+ * MIP-ARP requests targeting my_mip_addr cause the sender mapping to be
+ * inserted into cache. The function then sends a unicast MIP-ARP
+ * response on the interface on which the request arrived. MIP-ARP
+ * responses cause the sender mapping to be inserted into cache.
+ *
+ * Ping SDUs are currently recognized but not processed.
+ *
+ * This function returns no value. Receive errors and malformed frames are
+ * reported to stderr and ignored. It modifies cache when processing ARP
+ * messages, but does not use global variables.
+ */
+void handle_raw_socket(int sd_raw, int debug, struct arp_entry *cache,
+                       uint8_t my_mip_addr, struct mip_iface *ifaces, int n_ifaces)
 {
     uint8_t buf[1514];
     struct sockaddr_ll src_addr;
     socklen_t addr_len = sizeof(src_addr);
 
-    ssize_t n = recvfrom(
-        sd_raw, 
-        buf, 
-        sizeof(buf), 
-        0, 
-        (struct sockaddr *)&src_addr, 
-        &addr_len
-    );
+    ssize_t n = recvfrom(sd_raw, buf, sizeof(buf), 0,
+                         (struct sockaddr *)&src_addr, &addr_len);
 
     if (n == -1) {
         perror("recvfrom");
@@ -159,7 +255,7 @@ void handle_raw_socket(int sd_raw, int debug, struct arp_entry *cache, uint8_t m
     uint8_t *sdu = mip_hdr_start + MIP_HEADER_LEN;
     size_t sdu_len_bytes = sdu_len * 4;
 
-    size_t expected_len = sizeof(struct ethhdr) + 4 + sdu_len_bytes;
+    size_t expected_len = sizeof(struct ethhdr) + MIP_HEADER_LEN + sdu_len_bytes;
     if ((size_t)n < expected_len) {
         fprintf(stderr, "Frame shorter than SDU length claims\n");
         return;
@@ -183,13 +279,19 @@ void handle_raw_socket(int sd_raw, int debug, struct arp_entry *cache, uint8_t m
             if (arp_addr == my_mip_addr) {
                 arp_cache_insert(cache, src, eth->h_source, src_addr.sll_ifindex);
 
-                uint8_t response_sdu[4];
-                mip_arp_pack(response_sdu, MIP_ARP_RESPONSE, my_mip_addr);
+                uint8_t my_mac[6];
+                if (find_mac_by_ifindex(ifaces, n_ifaces, src_addr.sll_ifindex, my_mac)) {
+                    uint8_t response_sdu[4];
+                    mip_arp_pack(response_sdu, MIP_ARP_RESPONSE, my_mip_addr);
 
-                send_mip_frame(sd_raw, src_addr.sll_ifindex,
-                              eth->h_dest, eth->h_source,
-                              src, my_mip_addr, 1,
-                              MIP_TYPE_ARP, response_sdu, sizeof(response_sdu));
+                    send_mip_frame(sd_raw, src_addr.sll_ifindex,
+                                  my_mac, eth->h_source,
+                                  src, my_mip_addr, 1,
+                                  MIP_TYPE_ARP, response_sdu, sizeof(response_sdu));
+                } else if (debug) {
+                    printf("Could not find MAC for ifindex=%d, dropping ARP response\n",
+                           src_addr.sll_ifindex);
+                }
             }
         } else if (arp_type == MIP_ARP_RESPONSE) {
             arp_cache_insert(cache, src, eth->h_source, src_addr.sll_ifindex);
@@ -200,19 +302,42 @@ void handle_raw_socket(int sd_raw, int debug, struct arp_entry *cache, uint8_t m
         if (debug)
             printf("Unknown SDU type %u, ignoring\n", sdu_type);
     }
-
-    (void)sdu;
 }
 
-/*
-Build a MIP frame (Ethernet header + MIP header + SDU) and send
-it on the given raw socket and interface.
-
-Returns 0 on success, -1 on failure with errno set (EINVAL for
-bad arguments or misaligned SDU length, EMSGSIZE if the frame or
-SDU length is too large, EIO if sendto() sent fewer bytes than
-expected, or an error from sendto() itself).
-*/
+/**
+ * Construct and transmit one Ethernet frame containing a MIP datagram.
+ *
+ * sd_raw: Open AF_PACKET raw socket used for frame transmission.
+ * ifindex: System interface index of the outgoing Ethernet interface.
+ * src_mac: Pointer to the six-byte source Ethernet MAC address.
+ * dest_mac: Pointer to the six-byte destination Ethernet MAC address.
+ * mip_dst: Destination MIP address to write to the MIP header.
+ * mip_src: Source MIP address to write to the MIP header.
+ * ttl: MIP Time To Live value. mip_pack_header() stores its low four bits.
+ * sdu_type: Type of the MIP SDU. mip_pack_header() stores its low three
+ *           bits.
+ * sdu: Pointer to the SDU payload. It may be NULL only when
+ *      sdu_len_bytes is zero.
+ * sdu_len_bytes: Length of sdu in bytes. The value must be divisible by
+ *                four because MIP SDUs are measured in 32-bit words.
+ *
+ * The function creates an Ethernet header with Ethertype ETH_P_MIP,
+ * serializes a four-byte MIP header, appends the SDU, and sends the
+ * resulting frame with sendto() through sd_raw on ifindex.
+ *
+ * Returns 0 on success.
+ *
+ * Returns -1 on failure and sets errno. EINVAL indicates invalid
+ * pointers, an invalid interface index, or an SDU length that is not
+ * divisible by four. EMSGSIZE indicates that the constructed frame is
+ * larger than the local frame buffer. EIO indicates that sendto()
+ * returned a partial transmission. Errors reported directly by sendto()
+ * are propagated through errno.
+ *
+ * This function does not allocate dynamic memory and does not modify or
+ * take ownership of src_mac, dest_mac, or sdu. It does not use global
+ * variables.
+ */
 int send_mip_frame(int sd_raw, int ifindex,
                    const uint8_t *src_mac, const uint8_t *dest_mac,
                    uint8_t mip_dst, uint8_t mip_src, uint8_t ttl,
@@ -323,16 +448,37 @@ int send_mip_frame(int sd_raw, int ifindex,
 }
 
 
-/*
-Run MIP daemon's main event loop.
-
-Waits for activity on the listening upper-layer UNIX socket and, 
-once a client is connected, on that client's socket as well, using poll(). 
-Accepts new client connections, and reads and prints messages received from the connected client. 
-Only one upper-layer client is supported at a time, per the assignment specification.
-Once a client disconnects, the daemon goes back to waiting for a new connection.
-*/
-void run_daemon(int sd_upper, int sd_raw, int debug, struct arp_entry *cache, uint8_t my_mip_addr) {
+/**
+ * Run the main event loop of the MIP daemon.
+ *
+ * sd_upper: Listening UNIX domain socket for upper-layer applications.
+ * sd_raw: Raw AF_PACKET socket for incoming and outgoing MIP Ethernet
+ *         frames.
+ * debug: Non-zero enables diagnostic output.
+ * cache: MIP-ARP cache shared with received-frame processing.
+ * my_mip_addr: MIP address assigned to this daemon.
+ * ifaces: Array of discovered local Ethernet interfaces.
+ * n_ifaces: Number of valid entries in ifaces.
+ *
+ * The function uses poll() to wait for activity on the listening UNIX
+ * socket, the raw Ethernet socket, and, when connected, one upper-layer
+ * client socket. It accepts one upper-layer client at a time.
+ *
+ * Incoming raw Ethernet frames are passed to handle_raw_socket().
+ * Messages received from the upper-layer client are currently decoded as
+ * one destination MIP address followed by an SDU payload and printed to
+ * stdout. Outgoing MIP transmission from upper-layer messages is not yet
+ * implemented in the current version.
+ *
+ * The function normally runs indefinitely and returns only if poll()
+ * fails. A poll() failure is reported with perror().
+ *
+ * This function modifies cache through handle_raw_socket() and owns the
+ * local client socket descriptor while the event loop runs. It does not
+ * allocate dynamic memory or use global variables.
+ */
+void run_daemon(int sd_upper, int sd_raw, int debug, struct arp_entry *cache,
+               uint8_t my_mip_addr, struct mip_iface *ifaces, int n_ifaces) {
 
     int client_sd = -1;
 
@@ -371,7 +517,7 @@ void run_daemon(int sd_upper, int sd_raw, int debug, struct arp_entry *cache, ui
 
         /* Raw Ethernet frame has arrived */
         if (fds[1].revents & POLLIN) {
-            handle_raw_socket(sd_raw, debug, cache, my_mip_addr);
+            handle_raw_socket(sd_raw, debug, cache, my_mip_addr, ifaces, n_ifaces);
         }
 
         /* Connected client has sent something */
@@ -399,11 +545,26 @@ void run_daemon(int sd_upper, int sd_raw, int debug, struct arp_entry *cache, ui
 }
 
 
-/*
-Entry point for MIP daemon.
-Parses command line arguments.
-Validates MIP address (0-254), and prints parsed values if debug mode is activated.
-*/
+/**
+ * Start and configure the MIP daemon.
+ *
+ * argc: Number of command-line arguments.
+ * argv: Command-line argument array.
+ *
+ * The program accepts the options -h and -d, followed by a UNIX socket
+ * path and a MIP address in the range 0 through 254. Address 255 is
+ * rejected because it is reserved as the MIP broadcast address.
+ *
+ * The function creates the upper-layer UNIX socket, discovers local
+ * Ethernet interfaces, creates the raw Ethernet socket, initializes an
+ * empty MIP-ARP cache, and enters the daemon event loop.
+ *
+ * Returns 0 when -h is requested. Returns 1 for invalid command-line
+ * input. Under normal operation, run_daemon() does not return.
+ *
+ * Several setup failures are handled by helper functions that print an
+ * error and terminate the process. This function has no global variables.
+ */
 int main(int argc, char *argv[]) {
 
     int opt;
@@ -459,7 +620,7 @@ int main(int argc, char *argv[]) {
     
     struct arp_entry arp_cache[ARP_CACHE_SIZE] = {0};
 
-    run_daemon(sd_upper, sd_raw, debug, arp_cache, (uint8_t)mip_address);
+    run_daemon(sd_upper, sd_raw, debug, arp_cache, (uint8_t)mip_address, ifaces, n_ifaces);
 
     return 0;
 }
